@@ -28,6 +28,14 @@ DATASETS = {
 }
 
 
+def _prepare_text_target(embedding: torch.Tensor) -> torch.Tensor:
+    if embedding.dim() == 4:
+        assert embedding.size(1) == 1, "captions_per_sample must be 1"
+        embedding = embedding.squeeze(1)
+    assert embedding.dim() == 3, "text embeddings must be [B, N, D]"
+    return embedding.float()
+
+
 def parse_args() -> argparse.Namespace:
     default_device = "cuda" if torch.cuda.is_available() else "cpu"
     parser = argparse.ArgumentParser(description="High-level EEG->text alignment")
@@ -43,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default=default_device)
     parser.add_argument("--log_dir", type=str, default="logs")
+    parser.add_argument("--save_dir", type=str, default="checkpoints")
+    parser.add_argument("--save_every", type=int, default=0)
 
     parser.add_argument("--feature_dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -148,8 +158,8 @@ def run_epoch(
     split = "train" if train else "val"
     pbar = tqdm(loader, desc=f"{split} {epoch}", leave=False)
     for batch in pbar:
-        eeg = batch["eeg_data"].to(device)
-        target = batch["embedding"].squeeze(1).float().to(device)
+        eeg = batch["eeg_data"].to(device, dtype=torch.float32)
+        target = _prepare_text_target(batch["embedding"]).to(device)
 
         with torch.set_grad_enabled(train):
             pred = model(eeg)
@@ -210,6 +220,10 @@ def append_log(log_path: Path, epoch: int, split: str, stats: Dict[str, float]) 
         )
 
 
+def save_checkpoint(model: torch.nn.Module, path: Path) -> None:
+    torch.save(model.state_dict(), path)
+
+
 def main() -> None:
     args = parse_args()
     if args.device.startswith("cuda"):
@@ -256,6 +270,13 @@ def main() -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("epoch\tsplit\ttotal\tmse\tcontrast\tsinkhorn\n")
 
+    ckpt_dir = Path(args.save_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_stem = build_log_path(args).stem
+    best_path = ckpt_dir / f"{ckpt_stem}_best.pt"
+    last_path = ckpt_dir / f"{ckpt_stem}_last.pt"
+    best_val = float("inf")
+
     for epoch in range(1, args.epochs + 1):
         train_stats = run_epoch(
             model,
@@ -294,6 +315,14 @@ def main() -> None:
         )
         append_log(log_path, epoch, "train", train_stats)
         append_log(log_path, epoch, "val", val_stats)
+
+        if val_stats["total"] < best_val:
+            best_val = val_stats["total"]
+            save_checkpoint(model, best_path)
+        save_checkpoint(model, last_path)
+        if args.save_every > 0 and epoch % args.save_every == 0:
+            epoch_path = ckpt_dir / f"{ckpt_stem}_epoch{epoch}.pt"
+            save_checkpoint(model, epoch_path)
 
 
 if __name__ == "__main__":

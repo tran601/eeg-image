@@ -1,493 +1,565 @@
 import argparse
-import random
 import json
-from copy import deepcopy
-from datetime import datetime
+import random
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Set
 
-import numpy as np
 import torch
-import torch.nn.functional as F
-import yaml
 from PIL import Image
 from torch.utils.data import DataLoader
+from torchvision.transforms import functional as TF
+from tqdm import tqdm
+
+from diffusers import StableDiffusionPipeline
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
-from torchmetrics.functional.image.ssim import structural_similarity_index_measure
-from tqdm import tqdm
+from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure
+from transformers import CLIPImageProcessor, CLIPModel
+
 import lpips
 
-from dataset import EEG40Dataset, collate_fn_keep_captions
-from models import EEGEncoder, StableDiffusionBridge
-from utils import setup_logger
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.dataset import EEG40Dataset, EEG4Dataset, collate_fn_keep_captions
+from src.models.eeg_encoder import EEGEncoder
 
 
-def pil_to_tensor(image: Image.Image, device: torch.device) -> torch.Tensor:
-    array = np.array(image).astype(np.float32) / 255.0
-    tensor = torch.from_numpy(array).permute(2, 0, 1).to(device)
-    return tensor.clamp(0.0, 1.0)
+DATASETS = {
+    "eeg4": EEG4Dataset,
+    "eeg40": EEG40Dataset,
+}
 
 
-def pil_to_lpips_tensor(image: Image.Image, device: torch.device) -> torch.Tensor:
-    tensor = pil_to_tensor(image, device)
-    return tensor.mul(2.0).sub(1.0)
+def parse_args() -> argparse.Namespace:
+    default_device = "cuda" if torch.cuda.is_available() else "cpu"
+    parser = argparse.ArgumentParser(
+        description="Evaluate EEG-conditioned Stable Diffusion reconstructions."
+    )
+    parser.add_argument("--dataset", choices=DATASETS.keys(), default="eeg40")
+    parser.add_argument("--split", choices=["train", "val", "all"], default="val")
+    parser.add_argument(
+        "--embedding_type",
+        choices=["caption_embeddings", "image_embeddings", "class_text_embeddings"],
+        default="image_embeddings",
+    )
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--device", type=str, default=default_device)
+    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--save_samples", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--output_dir", type=str, default="outputs/eval")
+
+    parser.add_argument("--high_ckpt", type=str, default=None)
+    parser.add_argument("--low_ckpt", type=str, default=None)
+
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=["high", "low", "both"],
+        default=["high", "low", "both"],
+    )
+
+    parser.add_argument("--feature_dim", type=int, required=True)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--temporal_conv", type=str, required=True)
+    parser.add_argument("--spatial_conv", type=str, required=True)
+    parser.add_argument("--ts_conv", type=str, required=True)
+
+    parser.add_argument("--text_hidden_dim", type=int, default=None)
+    parser.add_argument("--text_tokens", type=int, default=77)
+    parser.add_argument("--text_token_dim", type=int, default=768)
+    parser.add_argument("--text_dropout", type=float, default=None)
+
+    parser.add_argument("--image_hidden_dim", type=int, default=None)
+    parser.add_argument("--image_output_dim", type=int, default=1024)
+    parser.add_argument("--image_dropout", type=float, default=None)
+
+    parser.add_argument(
+        "--sd_model",
+        type=str,
+        default="/home/chengwenjie/workspace/models/v1_5/stable-diffusion-v1-5/v1-5-pruned-emaonly.safetensors",
+    )
+    parser.add_argument(
+        "--ip_adapter_root",
+        type=str,
+        default="/home/chengwenjie/workspace/models/ip-adapter",
+    )
+    parser.add_argument("--ip_adapter_subfolder", type=str, default="models")
+    parser.add_argument("--ip_adapter_weight", type=str, default="ip-adapter_sd15.bin")
+    parser.add_argument("--ip_adapter_scale", type=float, default=1.0)
+    parser.add_argument("--ip_adapter_scales", type=str, default="0.3,0.5,0.7,1.0")
+    parser.add_argument("--guidance_scale", type=float, default=7.5)
+    parser.add_argument("--num_inference_steps", type=int, default=50)
+
+    parser.add_argument(
+        "--clip_model",
+        type=str,
+        default="openai/clip-vit-base-patch32",
+    )
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--width", type=int, default=None)
+    return parser.parse_args()
 
 
-def tensor_to_uint8(image_tensor: torch.Tensor) -> torch.Tensor:
-    return image_tensor.mul(255.0).clamp(0.0, 255.0).to(torch.uint8)
+def parse_int_list(raw: str) -> List[int]:
+    values = [int(item) for item in raw.split(",") if item.strip()]
+    assert values, "conv config must be a non-empty list"
+    return values
 
 
-TARGET_IMAGE_SIZE: Tuple[int, int] = (256, 256)
-
-SWEEP_VARIANTS: Sequence[Dict[str, Any]] = [
-    {
-        "name": "ip_adapter_on_scale_0_3_text_on",
-        "overrides": {
-            "stable_diffusion": {
-                "ip_adapter": {"enabled": True},
-                "ip_adapter_scale": 0.3,
-                "text_enabled": True,
-            }
-        },
-    },
-    {
-        "name": "ip_adapter_on_scale_0_5_text_on",
-        "overrides": {
-            "stable_diffusion": {
-                "ip_adapter": {"enabled": True},
-                "ip_adapter_scale": 0.5,
-                "text_enabled": True,
-            }
-        },
-    },
-    {
-        "name": "ip_adapter_on_scale_1_0_text_off",
-        "overrides": {
-            "stable_diffusion": {
-                "ip_adapter": {"enabled": True},
-                "ip_adapter_scale": 1.0,
-                "text_enabled": False,
-            }
-        },
-    },
-    {
-        "name": "ip_adapter_off_scale_0_0_text_on",
-        "overrides": {
-            "stable_diffusion": {
-                "ip_adapter": {"enabled": False},
-                "ip_adapter_scale": 0.0,
-                "text_enabled": True,
-            }
-        },
-    },
-]
+def build_encoder_config(
+    args: argparse.Namespace,
+    enable_text: bool,
+    enable_image: bool,
+) -> Dict:
+    text_hidden = args.text_hidden_dim or args.feature_dim
+    image_hidden = args.image_hidden_dim or args.feature_dim
+    text_dropout = args.text_dropout if args.text_dropout is not None else args.dropout
+    image_dropout = (
+        args.image_dropout if args.image_dropout is not None else args.dropout
+    )
+    config = {
+        "dropout": args.dropout,
+        "temporal_conv": parse_int_list(args.temporal_conv),
+        "spatial_conv": parse_int_list(args.spatial_conv),
+        "ts_conv": parse_int_list(args.ts_conv),
+        "feature_dim": args.feature_dim,
+        "heads": {},
+    }
+    if enable_text:
+        config["heads"]["text"] = {
+            "enabled": True,
+            "hidden_dim": text_hidden,
+            "tokens": args.text_tokens,
+            "token_dim": args.text_token_dim,
+            "dropout": text_dropout,
+        }
+    if enable_image:
+        config["heads"]["image"] = {
+            "enabled": True,
+            "hidden_dim": image_hidden,
+            "output_dim": args.image_output_dim,
+            "dropout": image_dropout,
+        }
+    return config
 
 
-def resize_image(image: Image.Image) -> Image.Image:
-    if image.size == TARGET_IMAGE_SIZE:
-        return image
-    return image.resize(TARGET_IMAGE_SIZE, Image.LANCZOS)
+def load_encoder(config: Dict, ckpt_path: str, device: torch.device) -> EEGEncoder:
+    if not ckpt_path:
+        raise ValueError("Checkpoint path is required for the selected mode.")
+    model = EEGEncoder(config)
+    state = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise ValueError("Checkpoint must be a state_dict dictionary.")
+    model.load_state_dict(state, strict=True)
+    model.to(device)
+    model.eval()
+    return model
 
 
-class Evaluator:
+def parse_scales(raw: str) -> List[float]:
+    return [float(item) for item in raw.split(",") if item.strip()]
+
+
+def pick_sample_indices(total: int, count: int, seed: int) -> Set[int]:
+    if total <= 0 or count <= 0:
+        return set()
+    rng = random.Random(seed)
+    count = min(count, total)
+    return set(rng.sample(range(total), count))
+
+
+def encode_empty_prompt(
+    pipe: StableDiffusionPipeline,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    tokens = pipe.tokenizer(
+        [""] * batch_size,
+        padding="max_length",
+        max_length=pipe.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    input_ids = tokens.input_ids.to(device)
+    attention_mask = getattr(tokens, "attention_mask", None)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+    outputs = pipe.text_encoder(input_ids, attention_mask=attention_mask)
+    embeds = outputs.last_hidden_state
+    return embeds.to(dtype=dtype)
+
+
+def prepare_ip_adapter_embeds(
+    image_embeds: torch.Tensor, guidance_scale: float
+) -> List[torch.Tensor]:
+    if image_embeds.dim() == 2:
+        image_embeds = image_embeds.unsqueeze(1)
+    assert image_embeds.dim() == 3, "image embeds must be [B,1,D]"
+    if guidance_scale > 1.0:
+        neg = torch.zeros_like(image_embeds)
+        image_embeds = torch.cat([neg, image_embeds], dim=0)
+    return [image_embeds]
+
+
+def resize_to_match(images: Sequence[Image.Image], target: Image.Image) -> List[Image]:
+    width, height = target.size
+    resized = []
+    for image in images:
+        if image.size != (width, height):
+            resized.append(image.resize((width, height), Image.BICUBIC))
+        else:
+            resized.append(image)
+    return resized
+
+
+class MetricsTracker:
     def __init__(
         self,
-        config: Union[str, Path, Dict[str, Any]],
-        text_ckpt: Path,
-        image_ckpt: Path,
-        output_dir: Path,
+        device: torch.device,
+        clip_model: CLIPModel,
+        clip_processor: CLIPImageProcessor,
     ) -> None:
-        if isinstance(config, (str, Path)):
-            with open(config, "r") as fp:
-                self.config = yaml.safe_load(fp)
-        elif isinstance(config, dict):
-            self.config = deepcopy(config)
-        else:
-            raise TypeError(
-                "config must be a path-like object or a configuration dictionary."
-            )
-        self.device = torch.device(self.config.get("device", "cuda"))
+        self.device = device
+        self.fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+        self.is_metric = InceptionScore(splits=10, normalize=True).to(device)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+        self.lpips = lpips.LPIPS(net="alex").to(device)
+        self.lpips.eval()
+        self.clip_model = clip_model
+        self.clip_processor = clip_processor
+        self.lpips_total = 0.0
+        self.clip_total = 0.0
+        self.count = 0
 
-        eval_cfg = self.config.get("evaluation", {})
-        self.num_samples = int(eval_cfg.get("num_samples", 200))
-        self.batch_size = int(eval_cfg.get("batch_size", 1))
-        self.num_generations_per_eeg = int(eval_cfg.get("num_generations_per_eeg", 1))
-        self.visualization_interval = int(eval_cfg.get("visualization_interval", 50))
-        self.visualization_groups = int(eval_cfg.get("visualization_groups", 8))
-        self.class_alpha = eval_cfg["class_alpha"]
-        self.visualization_cols = 2
-        self.visualization_rows = max(
-            1,
-            (self.visualization_groups + self.visualization_cols - 1)
-            // self.visualization_cols,
-        )
-        self.output_dir = output_dir
-        log_cfg = self.config.get("logging", {})
-        log_cfg["dir"] = "evaluation"
+    def update(
+        self,
+        generated: torch.Tensor,
+        original: torch.Tensor,
+        generated_pil: Sequence[Image.Image],
+        original_pil: Sequence[Image.Image],
+    ) -> None:
+        batch_size = generated.size(0)
+        self.fid.update(original, real=True)
+        self.fid.update(generated, real=False)
+        self.is_metric.update(generated)
+        self.ssim.update(generated, original)
 
-        self.logger, self.log_dir = setup_logger(
-            name="Evaluator",
-            config=self.config.get("logging", {}),
-            run_name=f"{self.output_dir}",
-        )
-        self.logger.info("Config:\n%s", json.dumps(self.config, indent=4))
-        self.visualization_dir = self.log_dir / "visualizations"
-        self.visualization_dir.mkdir(parents=True, exist_ok=True)
+        lpips_score = self.lpips(generated * 2 - 1, original * 2 - 1)
+        self.lpips_total += float(lpips_score.mean().item()) * batch_size
 
-        self.dataset = EEG40Dataset(split="val")
-        self.dataloader = DataLoader(
-            self.dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.config["training"]["text"].get("num_workers", 4),
-            pin_memory=True,
-            collate_fn=collate_fn_keep_captions,
-        )
+        clip_score = self._clip_similarity(generated_pil, original_pil)
+        self.clip_total += float(clip_score.sum().item())
+        self.count += batch_size
 
-        self.sd_bridge = StableDiffusionBridge(self.config["stable_diffusion"])
+    def _clip_similarity(
+        self, generated: Sequence[Image.Image], original: Sequence[Image.Image]
+    ) -> torch.Tensor:
+        with torch.inference_mode():
+            gen_inputs = self.clip_processor(
+                images=list(generated), return_tensors="pt"
+            ).to(self.device)
+            orig_inputs = self.clip_processor(
+                images=list(original), return_tensors="pt"
+            ).to(self.device)
+            gen_feat = self.clip_model.get_image_features(**gen_inputs)
+            orig_feat = self.clip_model.get_image_features(**orig_inputs)
+            gen_feat = gen_feat / gen_feat.norm(dim=-1, keepdim=True)
+            orig_feat = orig_feat / orig_feat.norm(dim=-1, keepdim=True)
+            return (gen_feat * orig_feat).sum(dim=-1)
 
-        self.text_encoder = EEGEncoder(self.config["model"]["eeg_encoder"]).to(
-            self.device
-        )
-        self.image_encoder = EEGEncoder(self.config["model"]["eeg_encoder"]).to(
-            self.device
-        )
-
-        self._load_checkpoint(self.text_encoder, text_ckpt)
-        self._load_checkpoint(self.image_encoder, image_ckpt)
-
-        self.text_encoder.eval()
-        self.image_encoder.eval()
-
-        self.inception = InceptionScore().to(self.device)
-        self.fid = FrechetInceptionDistance(feature=2048).to(self.device)
-        lpips_net = self.config["evaluation"]["metrics"].get("lpips_net", "alex")
-        self.lpips = lpips.LPIPS(net=lpips_net).to(self.device)
-        metrics_cfg = self.config["evaluation"]["metrics"]
-        clip_model_id = metrics_cfg.get("clip_model_path")
-        self.clip_model, self.clip_processor = self._load_clip_model(clip_model_id)
-
-    def _load_checkpoint(self, model: EEGEncoder, checkpoint_path: Path) -> None:
-        payload = torch.load(checkpoint_path, map_location=self.device)
-        missing, unexpected = model.load_state_dict(
-            payload["model_state_dict"], strict=False
-        )
-        if missing:
-            self.logger.warning(
-                "Missing keys when loading %s: %s", checkpoint_path, missing
-            )
-        if unexpected:
-            self.logger.warning(
-                "Unexpected keys when loading %s: %s", checkpoint_path, unexpected
-            )
-
-    def _load_clip_model(self, model_path: str) -> Tuple[Any, Any]:
-        try:
-            from transformers import CLIPModel, CLIPProcessor
-        except ImportError as exc:
-            raise ImportError(
-                "transformers package is required to compute CLIP scores. "
-                "Install it via `pip install transformers`."
-            ) from exc
-        if not model_path:
-            raise ValueError("A valid CLIP model path must be provided for evaluation.")
-        model = CLIPModel.from_pretrained(model_path).to(self.device)
-        processor = CLIPProcessor.from_pretrained(model_path)
-        model.eval()
-        return model, processor
-
-    def encode_images_with_clip(self, images: Sequence[Image.Image]) -> torch.Tensor:
-        if isinstance(images, Image.Image):
-            images = [images]
-        inputs = self.clip_processor(images=list(images), return_tensors="pt")
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
-        with torch.no_grad():
-            features = self.clip_model.get_image_features(**inputs)
-        return features
-
-    def evaluate(self) -> Dict[str, float]:
-        generated_images: List[Image.Image] = []
-        ground_truth_images: List[Image.Image] = []
-        clip_similarities: List[float] = []
-        lpips_scores: List[float] = []
-        ssim_scores: List[float] = []
-
-        processed = 0
-        eeg_samples_seen = 0
-
-        with torch.no_grad():
-            for batch in tqdm(self.dataloader, desc="Evaluating"):
-                eeg = batch["eeg_data"].to(self.device)
-                captions = [caps[0] if caps else "" for caps in batch["caption"]]
-                img_paths = batch["img_path"]
-
-                text_embeds = self.text_encoder.encode_text(eeg)
-                class_text_embeds = batch.get("class_text_embedding")
-                if class_text_embeds is not None:
-                    class_text_embeds = class_text_embeds.to(self.device)
-                    text_embeds = (
-                        1.0 - self.class_alpha
-                    ) * text_embeds + self.class_alpha * class_text_embeds
-                image_embeds = self.image_encoder.encode_image(eeg)
-
-                for idx, img_path in enumerate(img_paths):
-                    if processed >= self.num_samples:
-                        break
-
-                    text_embed = text_embeds[idx : idx + 1]
-                    image_embed = image_embeds[idx : idx + 1]
-                    gt_image = Image.open(img_path).convert("RGB")
-
-                    gt_image_resized = resize_image(gt_image)
-                    gt_tensor = pil_to_tensor(gt_image_resized, self.device)
-                    gt_tensor_uint8 = tensor_to_uint8(gt_tensor)
-                    gt_lpips = pil_to_lpips_tensor(gt_image_resized, self.device)
-                    gt_clip = self.encode_images_with_clip([gt_image_resized])
-
-                    per_eeg_count = 0
-                    while per_eeg_count < self.num_generations_per_eeg:
-                        if processed >= self.num_samples:
-                            break
-
-                        generated_batch = self.sd_bridge.generate(
-                            text_embeddings=text_embed,
-                            image_embeddings=image_embed,
-                        )
-                        if not generated_batch:
-                            break
-                        gen_image = generated_batch[0]
-                        gen_image_resized = resize_image(gen_image)
-
-                        generated_images.append(gen_image_resized)
-                        ground_truth_images.append(gt_image_resized.copy())
-
-                        gen_tensor = pil_to_tensor(gen_image_resized, self.device)
-                        gen_tensor_uint8 = tensor_to_uint8(gen_tensor)
-                        gen_lpips = pil_to_lpips_tensor(gen_image_resized, self.device)
-
-                        self.inception.update(gen_tensor_uint8.unsqueeze(0))
-                        self.fid.update(gt_tensor_uint8.unsqueeze(0), real=True)
-                        self.fid.update(gen_tensor_uint8.unsqueeze(0), real=False)
-
-                        ssim_val = structural_similarity_index_measure(
-                            gen_tensor.unsqueeze(0),
-                            gt_tensor.unsqueeze(0),
-                            data_range=1.0,
-                        )
-                        ssim_scores.append(ssim_val.item())
-
-                        lpips_val = self.lpips(
-                            gen_lpips.unsqueeze(0), gt_lpips.unsqueeze(0)
-                        )
-                        lpips_scores.append(lpips_val.item())
-
-                        gen_clip = self.encode_images_with_clip([gen_image_resized])
-                        clip_sim = F.cosine_similarity(gen_clip, gt_clip, dim=-1)
-                        clip_similarities.append(clip_sim.item())
-
-                        per_eeg_count += 1
-                        processed += 1
-
-                    gt_image.close()
-                    eeg_samples_seen += 1
-
-                    if (
-                        self.visualization_interval > 0
-                        and eeg_samples_seen % self.visualization_interval == 0
-                    ):
-                        self._visualize_samples(
-                            generated_images,
-                            ground_truth_images,
-                            eeg_samples_seen,
-                        )
-                        generated_images: List[Image.Image] = []
-                        ground_truth_images: List[Image.Image] = []
-
-                if processed >= self.num_samples:
-                    break
-
-        is_mean, is_std = self.inception.compute()
-        fid_score = self.fid.compute()
-
-        metrics = {
-            "inception_score_mean": float(is_mean),
-            "inception_score_std": float(is_std),
-            "fid": float(fid_score),
-            "ssim": float(np.mean(ssim_scores)),
-            "lpips": float(np.mean(lpips_scores)),
-            "clip_cosine_similarity": float(np.mean(clip_similarities)),
-            "num_images": processed,
+    def compute(self) -> Dict[str, float]:
+        assert self.count > 0, "no samples processed"
+        fid = float(self.fid.compute().item())
+        is_mean, is_std = self.is_metric.compute()
+        ssim = float(self.ssim.compute().item())
+        lpips_score = self.lpips_total / self.count
+        clip_score = self.clip_total / self.count
+        return {
+            "fid": fid,
+            "inception_score_mean": float(is_mean.item()),
+            "inception_score_std": float(is_std.item()),
+            "ssim": ssim,
+            "lpips": lpips_score,
+            "clip_image_score": clip_score,
         }
 
-        metrics_json = json.dumps(metrics, indent=4)
-        self.logger.info("Evaluation metrics:\n%s", metrics_json)
 
-        return metrics
+def save_pairs(
+    output_dir: Path,
+    indices: Set[int],
+    start_index: int,
+    generated: Sequence[Image.Image],
+    original: Sequence[Image.Image],
+) -> None:
+    if not indices:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for offset, (gen_img, orig_img) in enumerate(zip(generated, original, strict=True)):
+        index = start_index + offset
+        if index not in indices:
+            continue
+        gen_path = output_dir / f"{index:06d}_gen.png"
+        orig_path = output_dir / f"{index:06d}_gt.png"
+        gen_img.save(gen_path)
+        orig_img.save(orig_path)
 
-    def _visualize_samples(
-        self,
-        generated_images: Sequence[Image.Image],
-        ground_truth_images: Sequence[Image.Image],
-        step: int,
-    ) -> None:
-        required_groups = self.visualization_rows * self.visualization_cols
-        if (
-            self.visualization_groups <= 0
-            or self.num_generations_per_eeg <= 0
-            or required_groups <= 0
-        ):
-            return
 
-        total_groups = len(generated_images) // self.num_generations_per_eeg
-        if total_groups < required_groups:
-            return
+def build_images_from_paths(paths: Sequence[str]) -> List[Image.Image]:
+    images: List[Image.Image] = []
+    for path in paths:
+        image = Image.open(path).convert("RGB")
+        images.append(image)
+    return images
 
-        import matplotlib.pyplot as plt
 
-        try:
-            selected_indices = random.sample(range(total_groups), required_groups)
-        except ValueError:
-            selected_indices = list(range(total_groups))[:required_groups]
+def run_eval(
+    name: str,
+    pipe: StableDiffusionPipeline,
+    loader: DataLoader,
+    device: torch.device,
+    high_model: Optional[EEGEncoder],
+    low_model: Optional[EEGEncoder],
+    guidance_scale: float,
+    num_inference_steps: int,
+    ip_adapter_scale: Optional[float],
+    save_indices: Set[int],
+    output_dir: Path,
+    max_samples: Optional[int],
+    metrics: MetricsTracker,
+    height: Optional[int],
+    width: Optional[int],
+    seed: int,
+) -> Dict[str, float]:
+    dtype = pipe.unet.dtype
+    total = len(loader.dataset)
+    target_total = min(total, max_samples) if max_samples else total
+    generator = torch.Generator(device="cpu").manual_seed(seed)
 
-        selected_indices.sort()
+    processed = 0
+    progress = tqdm(total=target_total, desc=name)
+    for batch in loader:
+        if processed >= target_total:
+            break
 
-        unit_images: List[Image.Image] = []
-        for group_idx in selected_indices:
-            start = group_idx * self.num_generations_per_eeg
-            gt_image = ground_truth_images[start]
-            gens = generated_images[start : start + self.num_generations_per_eeg]
-            unit_images.append(self._compose_unit_image(gt_image, gens))
+        eeg = batch["eeg_data"].to(device, dtype=torch.float32)
+        paths = batch["img_path"]
+        batch_size = eeg.size(0)
 
-        fig, axes = plt.subplots(
-            self.visualization_rows,
-            self.visualization_cols,
-            figsize=(9, 6),
-        )
-        axes_iter = axes.flatten() if hasattr(axes, "flatten") else [axes]
+        remaining = target_total - processed
+        if batch_size > remaining:
+            eeg = eeg[:remaining]
+            paths = paths[:remaining]
+            batch_size = remaining
 
-        for idx, ax in enumerate(axes_iter):
-            if idx < len(unit_images):
-                ax.imshow(unit_images[idx])
-                ax.axis("off")
+        with torch.inference_mode():
+            uncond = encode_empty_prompt(pipe, batch_size, device, dtype)
+            if high_model is not None:
+                prompt_embeds = high_model.encode_text(eeg).to(dtype)
+                assert prompt_embeds.dim() == 3, "text embeds must be [B,77,768]"
             else:
-                ax.axis("off")
-        plt.tight_layout()
+                prompt_embeds = uncond
+            negative_prompt_embeds = uncond
 
-        viz_path = self.visualization_dir / f"step_{step:05d}.png"
-        fig.savefig(viz_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
+            ip_adapter_embeds = None
+            if low_model is not None:
+                image_embeds = low_model.encode_image(eeg).to(dtype)
+                assert image_embeds.dim() == 2, "image embeds must be [B,1024]"
+                ip_adapter_embeds = prepare_ip_adapter_embeds(
+                    image_embeds, guidance_scale
+                )
 
-    @staticmethod
-    def _compose_unit_image(
-        ground_truth: Image.Image,
-        generated_images: Sequence[Image.Image],
-        padding: int = 4,
-    ) -> Image.Image:
-        images = [ground_truth] + list(generated_images)
-        uniform_height = max(img.height for img in images)
-        resized: List[Image.Image] = []
-        for img in images:
-            local_img = img if img.mode == "RGB" else img.convert("RGB")
-            if local_img.height != uniform_height:
-                width = int(local_img.width * (uniform_height / local_img.height))
-                local_img = local_img.resize((width, uniform_height), Image.LANCZOS)
-            resized.append(local_img)
+            if ip_adapter_scale is not None:
+                pipe.set_ip_adapter_scale(ip_adapter_scale)
 
-        total_width = sum(img.width for img in resized) + padding * (len(resized) - 1)
-        canvas = Image.new("RGB", (total_width, uniform_height), color=(0, 0, 0))
+            pipe_kwargs = {
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "ip_adapter_image_embeds": ip_adapter_embeds,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "generator": generator,
+            }
+            if height is not None:
+                pipe_kwargs["height"] = height
+            if width is not None:
+                pipe_kwargs["width"] = width
+            result = pipe(**pipe_kwargs)
 
-        offset = 0
-        for idx, img in enumerate(resized):
-            canvas.paste(img, (offset, 0))
-            offset += img.width + padding
+        generated = [image.convert("RGB") for image in result.images]
+        original = build_images_from_paths(paths)
+        resized_original = resize_to_match(original, generated[0])
 
-        return canvas
+        generated_tensor = torch.stack(
+            [TF.to_tensor(image) for image in generated], dim=0
+        ).to(device)
+        original_tensor = torch.stack(
+            [TF.to_tensor(image) for image in resized_original], dim=0
+        ).to(device)
 
-
-def _deep_update(target: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
-    for key, value in overrides.items():
-        if isinstance(value, dict):
-            base_value = target.get(key, {})
-            if not isinstance(base_value, dict):
-                base_value = {}
-            target[key] = _deep_update(base_value, value)
-        else:
-            target[key] = value
-    return target
-
-
-def _run_param_sweep(args: argparse.Namespace) -> None:
-    with open(args.config, "r") as fp:
-        base_config = yaml.safe_load(fp)
-
-    sweep_metrics: Dict[str, Dict[str, float]] = {}
-    for variant in SWEEP_VARIANTS:
-        variant_config = deepcopy(base_config)
-        _deep_update(variant_config, variant["overrides"])
-        variant_output_dir = args.output_dir / variant["name"]
-        evaluator = Evaluator(
-            variant_config,
-            args.text_checkpoint,
-            args.image_checkpoint,
-            variant_output_dir,
+        metrics.update(generated_tensor, original_tensor, generated, resized_original)
+        save_pairs(
+            output_dir,
+            save_indices,
+            processed,
+            generated,
+            original,
         )
-        sweep_metrics[variant["name"]] = evaluator.evaluate()
+        processed += batch_size
+        progress.update(batch_size)
+    progress.close()
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = Path("evaluation") / args.output_dir / "param_sweep_metrics.json"
-    summary_path.write_text(json.dumps(sweep_metrics, indent=4))
-    print(f"Parameter sweep summary written to {summary_path}")
-
-    import gc
-
-    gc.collect()
+    return metrics.compute()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Evaluate EEG-driven Stable Diffusion pipeline."
-    )
-    parser.add_argument("--config", type=str, default="configs/default_40.yaml")
+    args = parse_args()
+    if args.device.startswith("cuda"):
+        assert torch.cuda.is_available(), "cuda requested but not available"
+    device = torch.device(args.device)
 
-    parser.add_argument(
-        "--image-checkpoint",
-        type=Path,
-        default="checkpoints/image_path/image_path_infonce/epoch_240.pt",
+    dataset_cls = DATASETS[args.dataset]
+    dataset = dataset_cls(split=args.split, embedding_type=args.embedding_type)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn_keep_captions,
     )
-    parser.add_argument(
-        "--text-checkpoint",
-        type=Path,
-        default="checkpoints/text_path/text_path_cosine/epoch_240.pt",
-    )
-    """
-    i_info_t_avg
-    i_info_t_eot
-    i_cos_t_avg
-    i_cos_t_eot
-    i_cos_t_cos
-    i_info_t_cos
-    
-    """
-    parser.add_argument("--output-dir", type=Path, default=Path("i_info_t_cos"))
-    parser.add_argument(
-        "--param-sweep",
-        default=True,
-        help=(
-            "Evaluate a fixed set of Stable Diffusion parameter combinations that "
-            "toggle the IP-Adapter and text guidance."
-        ),
-    )
-    args = parser.parse_args()
 
-    if args.param_sweep:
-        _run_param_sweep(args)
-        return
+    need_high = "high" in args.modes or "both" in args.modes
+    need_low = "low" in args.modes or "both" in args.modes
 
-    evaluator = Evaluator(
-        args.config, args.text_checkpoint, args.image_checkpoint, args.output_dir
+    high_model = None
+    if need_high:
+        high_cfg = build_encoder_config(args, enable_text=True, enable_image=False)
+        high_model = load_encoder(high_cfg, args.high_ckpt, device)
+
+    low_model = None
+    if need_low:
+        low_cfg = build_encoder_config(args, enable_text=False, enable_image=True)
+        low_model = load_encoder(low_cfg, args.low_ckpt, device)
+
+    pipe_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    pipe = StableDiffusionPipeline.from_single_file(
+        args.sd_model,
+        torch_dtype=pipe_dtype,
+        variant="fp16" if device.type == "cuda" else None,
+        use_safetensors=True,
+    ).to(device)
+
+    if need_low:
+        pipe.load_ip_adapter(
+            args.ip_adapter_root,
+            subfolder=args.ip_adapter_subfolder,
+            weight_name=args.ip_adapter_weight,
+        )
+
+    clip_model = CLIPModel.from_pretrained(args.clip_model).to(device)
+    clip_model.eval()
+    clip_processor = CLIPImageProcessor.from_pretrained(args.clip_model)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, Dict[str, float]] = {}
+    total_samples = len(dataset)
+    target_total = (
+        min(total_samples, args.max_samples) if args.max_samples else total_samples
     )
-    evaluator.evaluate()
+
+    if "high" in args.modes:
+        save_indices = pick_sample_indices(target_total, args.save_samples, args.seed)
+        metrics = MetricsTracker(device, clip_model, clip_processor)
+        results["high"] = run_eval(
+            name="high",
+            pipe=pipe,
+            loader=loader,
+            device=device,
+            high_model=high_model,
+            low_model=None,
+            guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps,
+            ip_adapter_scale=None,
+            save_indices=save_indices,
+            output_dir=output_dir / "samples" / "high",
+            max_samples=args.max_samples,
+            metrics=metrics,
+            height=args.height,
+            width=args.width,
+            seed=args.seed,
+        )
+
+    if "low" in args.modes:
+        save_indices = pick_sample_indices(
+            target_total, args.save_samples, args.seed + 1
+        )
+        metrics = MetricsTracker(device, clip_model, clip_processor)
+        results["low"] = run_eval(
+            name="low",
+            pipe=pipe,
+            loader=loader,
+            device=device,
+            high_model=None,
+            low_model=low_model,
+            guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps,
+            ip_adapter_scale=args.ip_adapter_scale,
+            save_indices=save_indices,
+            output_dir=output_dir / "samples" / "low",
+            max_samples=args.max_samples,
+            metrics=metrics,
+            height=args.height,
+            width=args.width,
+            seed=args.seed + 1,
+        )
+
+    if "both" in args.modes:
+        scales = parse_scales(args.ip_adapter_scales)
+        for idx, scale in enumerate(scales):
+            run_name = f"both_scale_{scale}"
+            save_indices = pick_sample_indices(
+                target_total, args.save_samples, args.seed + 10 + idx
+            )
+            metrics = MetricsTracker(device, clip_model, clip_processor)
+            results[run_name] = run_eval(
+                name=run_name,
+                pipe=pipe,
+                loader=loader,
+                device=device,
+                high_model=high_model,
+                low_model=low_model,
+                guidance_scale=args.guidance_scale,
+                num_inference_steps=args.num_inference_steps,
+                ip_adapter_scale=scale,
+                save_indices=save_indices,
+                output_dir=output_dir / "samples" / run_name,
+                max_samples=args.max_samples,
+                metrics=metrics,
+                height=args.height,
+                width=args.width,
+                seed=args.seed + 10 + idx,
+            )
+
+    metrics_path = output_dir / "metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as fp:
+        json.dump(
+            {
+                "results": results,
+                "num_samples": target_total,
+                "guidance_scale": args.guidance_scale,
+                "num_inference_steps": args.num_inference_steps,
+            },
+            fp,
+            indent=2,
+            ensure_ascii=True,
+        )
 
 
 if __name__ == "__main__":
