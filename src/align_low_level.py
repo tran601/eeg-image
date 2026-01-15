@@ -22,6 +22,16 @@ DATASETS = {
 }
 
 
+def _make_loader(dataset, args: argparse.Namespace, shuffle: bool) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn_keep_captions,
+    )
+
+
 def _prepare_image_target(embedding: torch.Tensor) -> torch.Tensor:
     if embedding.dim() == 3:
         assert embedding.size(1) == 1, "image embeddings must be [B, D]"
@@ -110,9 +120,7 @@ def run_epoch(
     epoch: int,
 ) -> Dict[str, float]:
     model.train() if train else model.eval()
-    total = 0.0
-    mse_total = 0.0
-    contrast_total = 0.0
+    totals = {"total": 0.0, "mse": 0.0, "contrast": 0.0}
     count = 0
 
     split = "train" if train else "val"
@@ -130,8 +138,7 @@ def run_epoch(
             if args.contrast_weight > 0.0:
                 contrast_value = contrastive_loss(pred, target)
 
-            loss = args.mse_weight * mse_value
-            loss = loss + args.contrast_weight * contrast_value
+            loss = args.mse_weight * mse_value + args.contrast_weight * contrast_value
 
             if train:
                 optimizer.zero_grad()
@@ -142,22 +149,20 @@ def run_epoch(
         loss_item = float(loss.item())
         mse_item = float(mse_value.item())
         contrast_item = float(contrast_value.item())
-        total += loss_item * batch_size
-        mse_total += mse_item * batch_size
-        contrast_total += contrast_item * batch_size
+        totals["total"] += loss_item * batch_size
+        totals["mse"] += mse_item * batch_size
+        totals["contrast"] += contrast_item * batch_size
         count += batch_size
         pbar.set_postfix(
             loss=f"{loss_item:.4f}",
             mse=f"{mse_item:.4f}",
             contrast=f"{contrast_item:.4f}",
-        )
+    )
 
     assert count > 0, "empty dataloader"
-    return {
-        "total": total / count,
-        "mse": mse_total / count,
-        "contrast": contrast_total / count,
-    }
+    for key in totals:
+        totals[key] /= count
+    return totals
 
 
 def append_log(
@@ -184,20 +189,8 @@ def main() -> None:
     train_set = dataset_cls(split="train", embedding_type=args.embedding_type)
     val_set = dataset_cls(split="val", embedding_type=args.embedding_type)
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn_keep_captions,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn_keep_captions,
-    )
+    train_loader = _make_loader(train_set, args, shuffle=True)
+    val_loader = _make_loader(val_set, args, shuffle=False)
 
     model = build_model(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -211,7 +204,7 @@ def main() -> None:
 
     ckpt_dir = Path(args.save_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_stem = build_log_path(args).stem
+    ckpt_stem = log_path.stem
     best_path = ckpt_dir / f"{ckpt_stem}_best.pt"
     last_path = ckpt_dir / f"{ckpt_stem}_last.pt"
     best_val = float("inf")

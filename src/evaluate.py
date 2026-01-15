@@ -24,13 +24,29 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.dataset import EEG40Dataset, EEG4Dataset, collate_fn_keep_captions
-from src.models.eeg_encoder import EEGEncoder
+from src.models.eeg_encoder import (
+    EEGAlign,
+    EEGBackbone,
+    ImageVectorHead,
+    LowRankTextHead,
+    TextTokenHead,
+)
 
 
 DATASETS = {
     "eeg4": EEG4Dataset,
     "eeg40": EEG40Dataset,
 }
+
+
+def _make_loader(dataset, args: argparse.Namespace) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn_keep_captions,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,6 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text_tokens", type=int, default=77)
     parser.add_argument("--text_token_dim", type=int, default=768)
     parser.add_argument("--text_dropout", type=float, default=None)
+    parser.add_argument("--text_head", choices=["dense", "lowrank"], default="dense")
+    parser.add_argument("--rank", type=int, default=64)
 
     parser.add_argument("--image_hidden_dim", type=int, default=None)
     parser.add_argument("--image_output_dim", type=int, default=1024)
@@ -105,53 +123,47 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_int_list(raw: str) -> List[int]:
-    values = [int(item) for item in raw.split(",") if item.strip()]
-    assert values, "conv config must be a non-empty list"
-    return values
-
-
-def build_encoder_config(
-    args: argparse.Namespace,
-    enable_text: bool,
-    enable_image: bool,
-) -> Dict:
-    text_hidden = args.text_hidden_dim or args.feature_dim
-    image_hidden = args.image_hidden_dim or args.feature_dim
+def build_text_model(args: argparse.Namespace) -> EEGAlign:
+    backbone = EEGBackbone(feature_dim=args.feature_dim, dropout=args.dropout)
     text_dropout = args.text_dropout if args.text_dropout is not None else args.dropout
-    image_dropout = (
-        args.image_dropout if args.image_dropout is not None else args.dropout
+    if args.text_head == "lowrank":
+        head = LowRankTextHead(
+            in_dim=args.feature_dim,
+            num_tokens=args.text_tokens,
+            token_dim=args.text_token_dim,
+            rank=args.rank,
+        )
+    else:
+        hidden = args.text_hidden_dim or args.feature_dim
+        head = TextTokenHead(
+            in_dim=args.feature_dim,
+            num_tokens=args.text_tokens,
+            token_dim=args.text_token_dim,
+            hidden=hidden,
+            dropout=text_dropout,
+        )
+    return EEGAlign(backbone=backbone, head=head)
+
+
+def build_image_model(args: argparse.Namespace) -> EEGAlign:
+    backbone = EEGBackbone(feature_dim=args.feature_dim, dropout=args.dropout)
+    hidden = args.image_hidden_dim or args.feature_dim
+    image_dropout = args.image_dropout if args.image_dropout is not None else args.dropout
+    head = ImageVectorHead(
+        in_dim=args.feature_dim,
+        out_dim=args.image_output_dim,
+        hidden=hidden,
+        dropout=image_dropout,
+        layernorm=True,
     )
-    config = {
-        "dropout": args.dropout,
-        "temporal_conv": parse_int_list(args.temporal_conv),
-        "spatial_conv": parse_int_list(args.spatial_conv),
-        "ts_conv": parse_int_list(args.ts_conv),
-        "feature_dim": args.feature_dim,
-        "heads": {},
-    }
-    if enable_text:
-        config["heads"]["text"] = {
-            "enabled": True,
-            "hidden_dim": text_hidden,
-            "tokens": args.text_tokens,
-            "token_dim": args.text_token_dim,
-            "dropout": text_dropout,
-        }
-    if enable_image:
-        config["heads"]["image"] = {
-            "enabled": True,
-            "hidden_dim": image_hidden,
-            "output_dim": args.image_output_dim,
-            "dropout": image_dropout,
-        }
-    return config
+    return EEGAlign(backbone=backbone, head=head)
 
 
-def load_encoder(config: Dict, ckpt_path: str, device: torch.device) -> EEGEncoder:
+def load_align_model(
+    model: EEGAlign, ckpt_path: str, device: torch.device
+) -> EEGAlign:
     if not ckpt_path:
         raise ValueError("Checkpoint path is required for the selected mode.")
-    model = EEGEncoder(config)
     state = torch.load(ckpt_path, map_location="cpu")
     if not isinstance(state, dict):
         raise ValueError("Checkpoint must be a state_dict dictionary.")
@@ -311,11 +323,7 @@ def save_pairs(
 
 
 def build_images_from_paths(paths: Sequence[str]) -> List[Image.Image]:
-    images: List[Image.Image] = []
-    for path in paths:
-        image = Image.open(path).convert("RGB")
-        images.append(image)
-    return images
+    return [Image.open(path).convert("RGB") for path in paths]
 
 
 def run_eval(
@@ -323,8 +331,8 @@ def run_eval(
     pipe: StableDiffusionPipeline,
     loader: DataLoader,
     device: torch.device,
-    high_model: Optional[EEGEncoder],
-    low_model: Optional[EEGEncoder],
+    high_model: Optional[EEGAlign],
+    low_model: Optional[EEGAlign],
     guidance_scale: float,
     num_inference_steps: int,
     ip_adapter_scale: Optional[float],
@@ -360,7 +368,7 @@ def run_eval(
         with torch.inference_mode():
             uncond = encode_empty_prompt(pipe, batch_size, device, dtype)
             if high_model is not None:
-                prompt_embeds = high_model.encode_text(eeg).to(dtype)
+                prompt_embeds = high_model(eeg).to(dtype)
                 assert prompt_embeds.dim() == 3, "text embeds must be [B,77,768]"
             else:
                 prompt_embeds = uncond
@@ -368,7 +376,7 @@ def run_eval(
 
             ip_adapter_embeds = None
             if low_model is not None:
-                image_embeds = low_model.encode_image(eeg).to(dtype)
+                image_embeds = low_model(eeg).to(dtype)
                 assert image_embeds.dim() == 2, "image embeds must be [B,1024]"
                 ip_adapter_embeds = prepare_ip_adapter_embeds(
                     image_embeds, guidance_scale
@@ -425,26 +433,18 @@ def main() -> None:
 
     dataset_cls = DATASETS[args.dataset]
     dataset = dataset_cls(split=args.split, embedding_type=args.embedding_type)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn_keep_captions,
-    )
+    loader = _make_loader(dataset, args)
 
     need_high = "high" in args.modes or "both" in args.modes
     need_low = "low" in args.modes or "both" in args.modes
 
     high_model = None
     if need_high:
-        high_cfg = build_encoder_config(args, enable_text=True, enable_image=False)
-        high_model = load_encoder(high_cfg, args.high_ckpt, device)
+        high_model = load_align_model(build_text_model(args), args.high_ckpt, device)
 
     low_model = None
     if need_low:
-        low_cfg = build_encoder_config(args, enable_text=False, enable_image=True)
-        low_model = load_encoder(low_cfg, args.low_ckpt, device)
+        low_model = load_align_model(build_image_model(args), args.low_ckpt, device)
 
     pipe_dtype = torch.float16 if device.type == "cuda" else torch.float32
     pipe = StableDiffusionPipeline.from_single_file(
@@ -474,77 +474,67 @@ def main() -> None:
         min(total_samples, args.max_samples) if args.max_samples else total_samples
     )
 
-    if "high" in args.modes:
-        save_indices = pick_sample_indices(target_total, args.save_samples, args.seed)
+    def run_mode(
+        name: str,
+        *,
+        high: Optional[EEGAlign],
+        low: Optional[EEGAlign],
+        ip_scale: Optional[float],
+        seed: int,
+        out_dir: Path,
+    ) -> None:
+        save_indices = pick_sample_indices(target_total, args.save_samples, seed)
         metrics = MetricsTracker(device, clip_model, clip_processor)
-        results["high"] = run_eval(
-            name="high",
+        results[name] = run_eval(
+            name=name,
             pipe=pipe,
             loader=loader,
             device=device,
-            high_model=high_model,
-            low_model=None,
+            high_model=high,
+            low_model=low,
             guidance_scale=args.guidance_scale,
             num_inference_steps=args.num_inference_steps,
-            ip_adapter_scale=None,
+            ip_adapter_scale=ip_scale,
             save_indices=save_indices,
-            output_dir=output_dir / "samples" / "high",
+            output_dir=out_dir,
             max_samples=args.max_samples,
             metrics=metrics,
             height=args.height,
             width=args.width,
+            seed=seed,
+        )
+
+    if "high" in args.modes:
+        run_mode(
+            "high",
+            high=high_model,
+            low=None,
+            ip_scale=None,
             seed=args.seed,
+            out_dir=output_dir / "samples" / "high",
         )
 
     if "low" in args.modes:
-        save_indices = pick_sample_indices(
-            target_total, args.save_samples, args.seed + 1
-        )
-        metrics = MetricsTracker(device, clip_model, clip_processor)
-        results["low"] = run_eval(
-            name="low",
-            pipe=pipe,
-            loader=loader,
-            device=device,
-            high_model=None,
-            low_model=low_model,
-            guidance_scale=args.guidance_scale,
-            num_inference_steps=args.num_inference_steps,
-            ip_adapter_scale=args.ip_adapter_scale,
-            save_indices=save_indices,
-            output_dir=output_dir / "samples" / "low",
-            max_samples=args.max_samples,
-            metrics=metrics,
-            height=args.height,
-            width=args.width,
+        run_mode(
+            "low",
+            high=None,
+            low=low_model,
+            ip_scale=args.ip_adapter_scale,
             seed=args.seed + 1,
+            out_dir=output_dir / "samples" / "low",
         )
 
     if "both" in args.modes:
         scales = parse_scales(args.ip_adapter_scales)
         for idx, scale in enumerate(scales):
             run_name = f"both_scale_{scale}"
-            save_indices = pick_sample_indices(
-                target_total, args.save_samples, args.seed + 10 + idx
-            )
-            metrics = MetricsTracker(device, clip_model, clip_processor)
-            results[run_name] = run_eval(
-                name=run_name,
-                pipe=pipe,
-                loader=loader,
-                device=device,
-                high_model=high_model,
-                low_model=low_model,
-                guidance_scale=args.guidance_scale,
-                num_inference_steps=args.num_inference_steps,
-                ip_adapter_scale=scale,
-                save_indices=save_indices,
-                output_dir=output_dir / "samples" / run_name,
-                max_samples=args.max_samples,
-                metrics=metrics,
-                height=args.height,
-                width=args.width,
+            run_mode(
+                run_name,
+                high=high_model,
+                low=low_model,
+                ip_scale=scale,
                 seed=args.seed + 10 + idx,
+                out_dir=output_dir / "samples" / run_name,
             )
 
     metrics_path = output_dir / "metrics.json"

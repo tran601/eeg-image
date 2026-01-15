@@ -1,10 +1,12 @@
 """Loss utilities for EEG training."""
 
-from .info_nce import SequenceInfoNCELoss, SupConCrossModalLoss
-from .sinkhorn_loss import SinkhornOTTokenAlignLoss
+from .basic_losses import CosineLoss, GlobalInfoNCELoss, MSELoss, pool_tokens
+from .sinkhorn_loss import TextPathLoss
 
 __all__ = [
-    "SequenceInfoNCELoss",
-    "SupConCrossModalLoss",
-    "SinkhornOTTokenAlignLoss",
+    "MSELoss",
+    "CosineLoss",
+    "GlobalInfoNCELoss",
+    "pool_tokens",
+    "TextPathLoss",
 ]

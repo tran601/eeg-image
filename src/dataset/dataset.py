@@ -176,7 +176,7 @@ class EEG40Dataset(Dataset):
             "image_id": image_id,
             "img_path": image_key,
             "word": word,
-            "embedding": embedding.float(),
+            "embedding": embedding,
         }
 
         return item
@@ -265,7 +265,7 @@ class EEG4Dataset(Dataset):
             "image_id": image_id,
             "img_path": image_key,
             "word": word,
-            "embedding": embedding.float(),
+            "embedding": embedding,
         }
 
         return item

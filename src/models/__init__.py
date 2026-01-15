@@ -2,7 +2,18 @@
 Model package exports.
 """
 
-from .eeg_encoder import EEGEncoder
-from .sd_bridge import StableDiffusionBridge
+from .eeg_encoder import (
+    EEGAlign,
+    EEGBackbone,
+    ImageVectorHead,
+    LowRankTextHead,
+    TextTokenHead,
+)
 
-__all__ = ["EEGEncoder", "StableDiffusionBridge"]
+__all__ = [
+    "EEGAlign",
+    "EEGBackbone",
+    "ImageVectorHead",
+    "LowRankTextHead",
+    "TextTokenHead",
+]
