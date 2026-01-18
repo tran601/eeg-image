@@ -10,7 +10,13 @@ from torch.utils.data._utils.collate import default_collate
 
 def collate_fn_keep_captions(batch):
     collated = {"eeg_data": default_collate([item["eeg_data"] for item in batch])}
-    for key in ("class_label", "image_id", "embedding"):
+    for key in (
+        "class_label",
+        "image_id",
+        "embedding",
+        "text_embedding",
+        "image_embedding",
+    ):
         if key in batch[0]:
             assert all(key in item for item in batch), f"batch missing key: {key}"
             collated[key] = default_collate([item[key] for item in batch])
@@ -79,6 +85,7 @@ class EEG40Dataset(Dataset):
         "caption_embeddings",
         "image_embeddings",
         "class_text_embeddings",
+        "both",
     )
 
     def __init__(
@@ -123,7 +130,11 @@ class EEG40Dataset(Dataset):
     def _load_embeddings(self, embedding_path: Path) -> None:
         payload = torch.load(embedding_path, map_location="cpu")
         self.captions = payload["caption_texts"]
-        self.embeddings = payload[self.embedding_type]
+        if self.embedding_type == "both":
+            self.text_embeddings = payload["caption_embeddings"]
+            self.image_embeddings = payload["image_embeddings"]
+        else:
+            self.embeddings = payload[self.embedding_type]
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -160,24 +171,44 @@ class EEG40Dataset(Dataset):
         full_captions: List[str] = self.captions[image_key]
         assert full_captions, f"missing captions for {image_key}"
 
-        caption, embedding = _select_caption_and_embedding(
-            full_captions,
-            self.embeddings,
-            self.embedding_type,
-            self.captions_per_sample,
-            image_key,
-            label_name,
-        )
-
-        item = {
-            "eeg_data": eeg_tensor,
-            "caption": caption,
-            "class_label": label,
-            "image_id": image_id,
-            "img_path": image_key,
-            "word": word,
-            "embedding": embedding,
-        }
+        if self.embedding_type == "both":
+            caption, text_embedding = _select_caption_and_embedding(
+                full_captions,
+                self.text_embeddings,
+                "caption_embeddings",
+                self.captions_per_sample,
+                image_key,
+                label_name,
+            )
+            image_embedding = self.image_embeddings[image_key]
+            item = {
+                "eeg_data": eeg_tensor,
+                "caption": caption,
+                "class_label": label,
+                "image_id": image_id,
+                "img_path": image_key,
+                "word": word,
+                "text_embedding": text_embedding,
+                "image_embedding": image_embedding,
+            }
+        else:
+            caption, embedding = _select_caption_and_embedding(
+                full_captions,
+                self.embeddings,
+                self.embedding_type,
+                self.captions_per_sample,
+                image_key,
+                label_name,
+            )
+            item = {
+                "eeg_data": eeg_tensor,
+                "caption": caption,
+                "class_label": label,
+                "image_id": image_id,
+                "img_path": image_key,
+                "word": word,
+                "embedding": embedding,
+            }
 
         return item
 
@@ -190,6 +221,7 @@ class EEG4Dataset(Dataset):
         "caption_embeddings",
         "image_embeddings",
         "class_text_embeddings",
+        "both",
     )
 
     def __init__(
@@ -227,7 +259,11 @@ class EEG4Dataset(Dataset):
     def _load_embeddings(self, embedding_path: Path) -> None:
         payload = torch.load(embedding_path, map_location="cpu")
         self.captions = payload["caption_texts"]
-        self.embeddings = payload[self.embedding_type]
+        if self.embedding_type == "both":
+            self.text_embeddings = payload["caption_embeddings"]
+            self.image_embeddings = payload["image_embeddings"]
+        else:
+            self.embeddings = payload[self.embedding_type]
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -249,23 +285,43 @@ class EEG4Dataset(Dataset):
         full_captions: List[str] = self.captions[image_key]
         assert full_captions, f"missing captions for {image_key}"
 
-        caption, embedding = _select_caption_and_embedding(
-            full_captions,
-            self.embeddings,
-            self.embedding_type,
-            self.captions_per_sample,
-            image_key,
-            label_name,
-        )
-
-        item = {
-            "eeg_data": eeg_tensor,
-            "caption": caption,
-            "class_label": label,
-            "image_id": image_id,
-            "img_path": image_key,
-            "word": word,
-            "embedding": embedding,
-        }
+        if self.embedding_type == "both":
+            caption, text_embedding = _select_caption_and_embedding(
+                full_captions,
+                self.text_embeddings,
+                "caption_embeddings",
+                self.captions_per_sample,
+                image_key,
+                label_name,
+            )
+            image_embedding = self.image_embeddings[image_key]
+            item = {
+                "eeg_data": eeg_tensor,
+                "caption": caption,
+                "class_label": label,
+                "image_id": image_id,
+                "img_path": image_key,
+                "word": word,
+                "text_embedding": text_embedding,
+                "image_embedding": image_embedding,
+            }
+        else:
+            caption, embedding = _select_caption_and_embedding(
+                full_captions,
+                self.embeddings,
+                self.embedding_type,
+                self.captions_per_sample,
+                image_key,
+                label_name,
+            )
+            item = {
+                "eeg_data": eeg_tensor,
+                "caption": caption,
+                "class_label": label,
+                "image_id": image_id,
+                "img_path": image_key,
+                "word": word,
+                "embedding": embedding,
+            }
 
         return item

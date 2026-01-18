@@ -7,11 +7,12 @@ from typing import Dict, List, Optional, Sequence, Set
 
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from compel import Compel
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
 from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure
@@ -31,6 +32,7 @@ from src.models.eeg_encoder import (
     LowRankTextHead,
     TextTokenHead,
 )
+from src.utils import set_seed
 
 
 DATASETS = {
@@ -38,12 +40,32 @@ DATASETS = {
     "eeg40": EEG40Dataset,
 }
 
+NEGATIVE_PROMPT = (
+    "cartoon, illustration, 3d render, plastic, lowres, blurry, jpeg artifacts, "
+    "watermark, text, logo, cropped, deformed, bad anatomy, extra limbs, "
+    "oversaturated, multiple subjects, clutter, fisheye, motion blur, "
+    "studio backdrop, cutout"
+)
+
+# Defaults aligned with src/align_high_level.py and src/align_low_level.py.
+HIGH_FEATURE_DIM = 512
+HIGH_DROPOUT = 0.1
+HIGH_HIDDEN_DIM = 512
+HIGH_NUM_TOKENS = 77
+HIGH_TOKEN_DIM = 768
+HIGH_RANK = 64
+
+LOW_FEATURE_DIM = 512
+LOW_DROPOUT = 0.1
+LOW_HIDDEN_DIM = 512
+LOW_OUT_DIM = 1024
+
 
 def _make_loader(dataset, args: argparse.Namespace) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_fn_keep_captions,
     )
@@ -58,48 +80,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=["train", "val", "all"], default="val")
     parser.add_argument(
         "--embedding_type",
-        choices=["caption_embeddings", "image_embeddings", "class_text_embeddings"],
-        default="image_embeddings",
+        choices=["caption_embeddings", "image_embeddings", "both"],
+        default=None,
     )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--device", type=str, default=default_device)
     parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--save_samples", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--save_samples", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="outputs/eval")
 
-    parser.add_argument("--high_ckpt", type=str, default=None)
-    parser.add_argument("--low_ckpt", type=str, default=None)
-
     parser.add_argument(
-        "--modes",
-        nargs="+",
-        choices=["high", "low", "both"],
-        default=["high", "low", "both"],
+        "--high_ckpt",
+        type=str,
+        default=(
+            "/home/chengwenjie/workspace/masterCode2_simple/checkpoints/"
+            "align_high__dataset=eeg40__embedding=caption_embeddings__text_head=dense__pool=mean__loss=mse+cosine+sinkhorn_last.pt"
+        ),
+    )
+    parser.add_argument(
+        "--low_ckpt",
+        type=str,
+        default=(
+            "/home/chengwenjie/workspace/masterCode2_simple/checkpoints/"
+            "align_low__dataset=eeg40__embedding=image_embeddings__loss=mse+cosine_last.pt"
+        ),
     )
 
-    parser.add_argument("--feature_dim", type=int, required=True)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--temporal_conv", type=str, required=True)
-    parser.add_argument("--spatial_conv", type=str, required=True)
-    parser.add_argument("--ts_conv", type=str, required=True)
+    parser.add_argument("--modes", choices=["high", "low", "both"], default="high")
 
-    parser.add_argument("--text_hidden_dim", type=int, default=None)
-    parser.add_argument("--text_tokens", type=int, default=77)
-    parser.add_argument("--text_token_dim", type=int, default=768)
-    parser.add_argument("--text_dropout", type=float, default=None)
     parser.add_argument("--text_head", choices=["dense", "lowrank"], default="dense")
-    parser.add_argument("--rank", type=int, default=64)
-
-    parser.add_argument("--image_hidden_dim", type=int, default=None)
-    parser.add_argument("--image_output_dim", type=int, default=1024)
-    parser.add_argument("--image_dropout", type=float, default=None)
 
     parser.add_argument(
         "--sd_model",
         type=str,
-        default="/home/chengwenjie/workspace/models/v1_5/stable-diffusion-v1-5/v1-5-pruned-emaonly.safetensors",
+        default="/home/chengwenjie/workspace/models/v1_5/stable-diffusion-v1-5",
     )
     parser.add_argument(
         "--ip_adapter_root",
@@ -109,14 +125,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ip_adapter_subfolder", type=str, default="models")
     parser.add_argument("--ip_adapter_weight", type=str, default="ip-adapter_sd15.bin")
     parser.add_argument("--ip_adapter_scale", type=float, default=1.0)
-    parser.add_argument("--ip_adapter_scales", type=str, default="0.3,0.5,0.7,1.0")
-    parser.add_argument("--guidance_scale", type=float, default=7.5)
-    parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--guidance_scale", type=float, default=8.0)
+    parser.add_argument("--num_inference_steps", type=int, default=30)
 
     parser.add_argument(
         "--clip_model",
         type=str,
-        default="openai/clip-vit-base-patch32",
+        default="/home/chengwenjie/workspace/models/CLIP-ViT-B-32-laion2B-s34B-b79K",
     )
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
@@ -124,44 +139,38 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_text_model(args: argparse.Namespace) -> EEGAlign:
-    backbone = EEGBackbone(feature_dim=args.feature_dim, dropout=args.dropout)
-    text_dropout = args.text_dropout if args.text_dropout is not None else args.dropout
+    backbone = EEGBackbone(feature_dim=HIGH_FEATURE_DIM, dropout=HIGH_DROPOUT)
     if args.text_head == "lowrank":
         head = LowRankTextHead(
-            in_dim=args.feature_dim,
-            num_tokens=args.text_tokens,
-            token_dim=args.text_token_dim,
-            rank=args.rank,
+            in_dim=HIGH_FEATURE_DIM,
+            num_tokens=HIGH_NUM_TOKENS,
+            token_dim=HIGH_TOKEN_DIM,
+            rank=HIGH_RANK,
         )
     else:
-        hidden = args.text_hidden_dim or args.feature_dim
         head = TextTokenHead(
-            in_dim=args.feature_dim,
-            num_tokens=args.text_tokens,
-            token_dim=args.text_token_dim,
-            hidden=hidden,
-            dropout=text_dropout,
+            in_dim=HIGH_FEATURE_DIM,
+            num_tokens=HIGH_NUM_TOKENS,
+            token_dim=HIGH_TOKEN_DIM,
+            hidden=HIGH_HIDDEN_DIM,
+            dropout=HIGH_DROPOUT,
         )
     return EEGAlign(backbone=backbone, head=head)
 
 
-def build_image_model(args: argparse.Namespace) -> EEGAlign:
-    backbone = EEGBackbone(feature_dim=args.feature_dim, dropout=args.dropout)
-    hidden = args.image_hidden_dim or args.feature_dim
-    image_dropout = args.image_dropout if args.image_dropout is not None else args.dropout
+def build_image_model() -> EEGAlign:
+    backbone = EEGBackbone(feature_dim=LOW_FEATURE_DIM, dropout=LOW_DROPOUT)
     head = ImageVectorHead(
-        in_dim=args.feature_dim,
-        out_dim=args.image_output_dim,
-        hidden=hidden,
-        dropout=image_dropout,
+        in_dim=LOW_FEATURE_DIM,
+        out_dim=LOW_OUT_DIM,
+        hidden=LOW_HIDDEN_DIM,
+        dropout=LOW_DROPOUT,
         layernorm=True,
     )
     return EEGAlign(backbone=backbone, head=head)
 
 
-def load_align_model(
-    model: EEGAlign, ckpt_path: str, device: torch.device
-) -> EEGAlign:
+def load_align_model(model: EEGAlign, ckpt_path: str, device: torch.device) -> EEGAlign:
     if not ckpt_path:
         raise ValueError("Checkpoint path is required for the selected mode.")
     state = torch.load(ckpt_path, map_location="cpu")
@@ -173,10 +182,6 @@ def load_align_model(
     return model
 
 
-def parse_scales(raw: str) -> List[float]:
-    return [float(item) for item in raw.split(",") if item.strip()]
-
-
 def pick_sample_indices(total: int, count: int, seed: int) -> Set[int]:
     if total <= 0 or count <= 0:
         return set()
@@ -186,25 +191,23 @@ def pick_sample_indices(total: int, count: int, seed: int) -> Set[int]:
 
 
 def encode_empty_prompt(
-    pipe: StableDiffusionPipeline,
+    compel_proc: Compel,
     batch_size: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    tokens = pipe.tokenizer(
-        [""] * batch_size,
-        padding="max_length",
-        max_length=pipe.tokenizer.model_max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
-    input_ids = tokens.input_ids.to(device)
-    attention_mask = getattr(tokens, "attention_mask", None)
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
-    outputs = pipe.text_encoder(input_ids, attention_mask=attention_mask)
-    embeds = outputs.last_hidden_state
-    return embeds.to(dtype=dtype)
+    embeds = compel_proc([""] * batch_size)
+    return embeds.to(device=device, dtype=dtype)
+
+
+def encode_prompt(
+    compel_proc: Compel,
+    prompt: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    embeds = compel_proc([prompt])
+    return embeds.to(device=device, dtype=dtype)
 
 
 def prepare_ip_adapter_embeds(
@@ -219,7 +222,25 @@ def prepare_ip_adapter_embeds(
     return [image_embeds]
 
 
-def resize_to_match(images: Sequence[Image.Image], target: Image.Image) -> List[Image]:
+def prepare_text_embedding(text_embeds: torch.Tensor) -> torch.Tensor:
+    if text_embeds.dim() == 4:
+        assert text_embeds.size(1) == 1, "text embeds must be [B,77,768]"
+        text_embeds = text_embeds.squeeze(1)
+    assert text_embeds.dim() == 3, "text embeds must be [B,77,768]"
+    return text_embeds.float()
+
+
+def prepare_image_embedding(image_embeds: torch.Tensor) -> torch.Tensor:
+    if image_embeds.dim() == 3:
+        assert image_embeds.size(1) == 1, "image embeds must be [B,1024]"
+        image_embeds = image_embeds.squeeze(1)
+    assert image_embeds.dim() == 2, "image embeds must be [B,1024]"
+    return image_embeds.float()
+
+
+def resize_to_match(
+    images: Sequence[Image.Image], target: Image.Image
+) -> List[Image.Image]:
     width, height = target.size
     resized = []
     for image in images:
@@ -302,24 +323,34 @@ class MetricsTracker:
         }
 
 
-def save_pairs(
+def save_triplets(
     output_dir: Path,
     indices: Set[int],
     start_index: int,
-    generated: Sequence[Image.Image],
+    paths: Sequence[str],
     original: Sequence[Image.Image],
+    embedded: Sequence[Image.Image],
+    eeg_generated: Sequence[Image.Image],
 ) -> None:
     if not indices:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
-    for offset, (gen_img, orig_img) in enumerate(zip(generated, original, strict=True)):
+    for offset, (path, orig_img, embed_img, eeg_img) in enumerate(
+        zip(paths, original, embedded, eeg_generated, strict=True)
+    ):
         index = start_index + offset
         if index not in indices:
             continue
-        gen_path = output_dir / f"{index:06d}_gen.png"
-        orig_path = output_dir / f"{index:06d}_gt.png"
-        gen_img.save(gen_path)
-        orig_img.save(orig_path)
+        gap = 5
+        images = [orig_img, embed_img, eeg_img]
+        total_width = sum(image.width for image in images) + gap * (len(images) - 1)
+        max_height = max(image.height for image in images)
+        merged = Image.new("RGB", (total_width, max_height))
+        x_offset = 0
+        for image in images:
+            merged.paste(image, (x_offset, 0))
+            x_offset += image.width + gap
+        merged.save(output_dir / Path(path).name)
 
 
 def build_images_from_paths(paths: Sequence[str]) -> List[Image.Image]:
@@ -328,7 +359,10 @@ def build_images_from_paths(paths: Sequence[str]) -> List[Image.Image]:
 
 def run_eval(
     name: str,
+    mode: str,
     pipe: StableDiffusionPipeline,
+    compel_proc: Compel,
+    negative_prompt_embed: torch.Tensor,
     loader: DataLoader,
     device: torch.device,
     high_model: Optional[EEGAlign],
@@ -338,105 +372,152 @@ def run_eval(
     ip_adapter_scale: Optional[float],
     save_indices: Set[int],
     output_dir: Path,
-    max_samples: Optional[int],
-    metrics: MetricsTracker,
+    metrics_eeg_original: MetricsTracker,
+    metrics_eeg_embedding: MetricsTracker,
     height: Optional[int],
     width: Optional[int],
-    seed: int,
-) -> Dict[str, float]:
+) -> Dict[str, Dict[str, float]]:
     dtype = pipe.unet.dtype
-    total = len(loader.dataset)
-    target_total = min(total, max_samples) if max_samples else total
-    generator = torch.Generator(device="cpu").manual_seed(seed)
+    if ip_adapter_scale is not None:
+        pipe.set_ip_adapter_scale(ip_adapter_scale)
 
-    processed = 0
-    progress = tqdm(total=target_total, desc=name)
-    for batch in loader:
-        if processed >= target_total:
-            break
-
+    for batch_idx, batch in enumerate(tqdm(loader, desc=name)):
         eeg = batch["eeg_data"].to(device, dtype=torch.float32)
         paths = batch["img_path"]
         batch_size = eeg.size(0)
 
-        remaining = target_total - processed
-        if batch_size > remaining:
-            eeg = eeg[:remaining]
-            paths = paths[:remaining]
-            batch_size = remaining
-
         with torch.inference_mode():
-            uncond = encode_empty_prompt(pipe, batch_size, device, dtype)
+            uncond = encode_empty_prompt(compel_proc, batch_size, device, dtype)
             if high_model is not None:
-                prompt_embeds = high_model(eeg).to(dtype)
-                assert prompt_embeds.dim() == 3, "text embeds must be [B,77,768]"
+                eeg_prompt_embeds = high_model(eeg).to(dtype)
+                assert eeg_prompt_embeds.dim() == 3, "text embeds must be [B,77,768]"
             else:
-                prompt_embeds = uncond
-            negative_prompt_embeds = uncond
+                eeg_prompt_embeds = uncond
+            negative_prompt_embeds = negative_prompt_embed.expand(batch_size, -1, -1)
 
-            ip_adapter_embeds = None
+            eeg_ip_adapter_embeds = None
             if low_model is not None:
-                image_embeds = low_model(eeg).to(dtype)
-                assert image_embeds.dim() == 2, "image embeds must be [B,1024]"
-                ip_adapter_embeds = prepare_ip_adapter_embeds(
+                eeg_image_embeds = low_model(eeg).to(dtype)
+                assert eeg_image_embeds.dim() == 2, "image embeds must be [B,1024]"
+                eeg_ip_adapter_embeds = prepare_ip_adapter_embeds(
+                    eeg_image_embeds, guidance_scale
+                )
+
+            embed_prompt_embeds = uncond
+            embed_ip_adapter_embeds = None
+            if mode == "high":
+                text_embeds = prepare_text_embedding(batch["embedding"]).to(
+                    device, dtype=dtype
+                )
+                embed_prompt_embeds = text_embeds
+            elif mode == "low":
+                image_embeds = prepare_image_embedding(batch["embedding"]).to(
+                    device, dtype=dtype
+                )
+                embed_ip_adapter_embeds = prepare_ip_adapter_embeds(
+                    image_embeds, guidance_scale
+                )
+            else:
+                text_embeds = prepare_text_embedding(batch["text_embedding"]).to(
+                    device, dtype=dtype
+                )
+                image_embeds = prepare_image_embedding(batch["image_embedding"]).to(
+                    device, dtype=dtype
+                )
+                embed_prompt_embeds = text_embeds
+                embed_ip_adapter_embeds = prepare_ip_adapter_embeds(
                     image_embeds, guidance_scale
                 )
 
-            if ip_adapter_scale is not None:
-                pipe.set_ip_adapter_scale(ip_adapter_scale)
-
             pipe_kwargs = {
-                "prompt_embeds": prompt_embeds,
                 "negative_prompt_embeds": negative_prompt_embeds,
-                "ip_adapter_image_embeds": ip_adapter_embeds,
                 "num_inference_steps": num_inference_steps,
                 "guidance_scale": guidance_scale,
-                "generator": generator,
             }
             if height is not None:
                 pipe_kwargs["height"] = height
             if width is not None:
                 pipe_kwargs["width"] = width
-            result = pipe(**pipe_kwargs)
+            embed_result = pipe(
+                prompt_embeds=embed_prompt_embeds,
+                ip_adapter_image_embeds=embed_ip_adapter_embeds,
+                **pipe_kwargs,
+            )
+            eeg_result = pipe(
+                prompt_embeds=eeg_prompt_embeds,
+                ip_adapter_image_embeds=eeg_ip_adapter_embeds,
+                **pipe_kwargs,
+            )
 
-        generated = [image.convert("RGB") for image in result.images]
+        embedded_generated = [image.convert("RGB") for image in embed_result.images]
+        eeg_generated = [image.convert("RGB") for image in eeg_result.images]
         original = build_images_from_paths(paths)
-        resized_original = resize_to_match(original, generated[0])
+        assert (
+            embedded_generated[0].size == eeg_generated[0].size
+        ), "generated sizes must match"
+        resized_original = resize_to_match(original, embedded_generated[0])
 
-        generated_tensor = torch.stack(
-            [TF.to_tensor(image) for image in generated], dim=0
+        embedded_tensor = torch.stack(
+            [TF.to_tensor(image) for image in embedded_generated], dim=0
+        ).to(device)
+        eeg_tensor = torch.stack(
+            [TF.to_tensor(image) for image in eeg_generated], dim=0
         ).to(device)
         original_tensor = torch.stack(
             [TF.to_tensor(image) for image in resized_original], dim=0
         ).to(device)
 
-        metrics.update(generated_tensor, original_tensor, generated, resized_original)
-        save_pairs(
+        metrics_eeg_original.update(
+            eeg_tensor, original_tensor, eeg_generated, resized_original
+        )
+        metrics_eeg_embedding.update(
+            eeg_tensor, embedded_tensor, eeg_generated, embedded_generated
+        )
+        assert loader.batch_size is not None, "loader batch_size is required"
+        save_triplets(
             output_dir,
             save_indices,
-            processed,
-            generated,
-            original,
+            batch_idx * loader.batch_size,
+            paths,
+            resized_original,
+            embedded_generated,
+            eeg_generated,
         )
-        processed += batch_size
-        progress.update(batch_size)
-    progress.close()
 
-    return metrics.compute()
+    return {
+        "eeg_vs_original": metrics_eeg_original.compute(),
+        "eeg_vs_embedding": metrics_eeg_embedding.compute(),
+    }
 
 
 def main() -> None:
     args = parse_args()
     if args.device.startswith("cuda"):
         assert torch.cuda.is_available(), "cuda requested but not available"
+    set_seed(args.seed)
     device = torch.device(args.device)
 
+    mode = args.modes
+    if mode == "high":
+        embedding_type = "caption_embeddings"
+    elif mode == "low":
+        embedding_type = "image_embeddings"
+    else:
+        embedding_type = "both"
+    if args.embedding_type is not None:
+        assert (
+            args.embedding_type == embedding_type
+        ), "embedding_type must match modes"
+
     dataset_cls = DATASETS[args.dataset]
-    dataset = dataset_cls(split=args.split, embedding_type=args.embedding_type)
+    dataset = dataset_cls(split=args.split, embedding_type=embedding_type)
+    if args.max_samples is not None:
+        max_count = min(len(dataset), args.max_samples)
+        dataset = Subset(dataset, range(max_count))
     loader = _make_loader(dataset, args)
 
-    need_high = "high" in args.modes or "both" in args.modes
-    need_low = "low" in args.modes or "both" in args.modes
+    need_high = mode in {"high", "both"}
+    need_low = mode in {"low", "both"}
 
     high_model = None
     if need_high:
@@ -444,21 +525,25 @@ def main() -> None:
 
     low_model = None
     if need_low:
-        low_model = load_align_model(build_image_model(args), args.low_ckpt, device)
+        low_model = load_align_model(build_image_model(), args.low_ckpt, device)
 
-    pipe_dtype = torch.float16 if device.type == "cuda" else torch.float32
-    pipe = StableDiffusionPipeline.from_single_file(
+    pipe = StableDiffusionPipeline.from_pretrained(
         args.sd_model,
-        torch_dtype=pipe_dtype,
-        variant="fp16" if device.type == "cuda" else None,
-        use_safetensors=True,
+        torch_dtype=torch.float16,
     ).to(device)
 
-    if need_low:
-        pipe.load_ip_adapter(
-            args.ip_adapter_root,
-            subfolder=args.ip_adapter_subfolder,
-            weight_name=args.ip_adapter_weight,
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config,
+        use_karras_sigmas=True,
+    )
+
+    compel_proc = Compel(tokenizer=pipe.tokenizer, text_encoder=pipe.text_encoder)
+    with torch.inference_mode():
+        negative_prompt_embed = encode_prompt(
+            compel_proc,
+            NEGATIVE_PROMPT,
+            device,
+            pipe.unet.dtype,
         )
 
     clip_model = CLIPModel.from_pretrained(args.clip_model).to(device)
@@ -468,74 +553,39 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    results: Dict[str, Dict[str, float]] = {}
-    total_samples = len(dataset)
-    target_total = (
-        min(total_samples, args.max_samples) if args.max_samples else total_samples
+    results: Dict[str, Dict[str, Dict[str, float]]] = {}
+    target_total = len(dataset)
+
+    if need_low:
+        pipe.load_ip_adapter(
+            args.ip_adapter_root,
+            subfolder=args.ip_adapter_subfolder,
+            weight_name=args.ip_adapter_weight,
+        )
+
+    save_indices = pick_sample_indices(target_total, args.save_samples, args.seed)
+    metrics_eeg_original = MetricsTracker(device, clip_model, clip_processor)
+    metrics_eeg_embedding = MetricsTracker(device, clip_model, clip_processor)
+    results[mode] = run_eval(
+        name=mode,
+        mode=mode,
+        pipe=pipe,
+        compel_proc=compel_proc,
+        negative_prompt_embed=negative_prompt_embed,
+        loader=loader,
+        device=device,
+        high_model=high_model if need_high else None,
+        low_model=low_model if need_low else None,
+        guidance_scale=args.guidance_scale,
+        num_inference_steps=args.num_inference_steps,
+        ip_adapter_scale=args.ip_adapter_scale if need_low else None,
+        save_indices=save_indices,
+        output_dir=output_dir / "samples" / mode,
+        metrics_eeg_original=metrics_eeg_original,
+        metrics_eeg_embedding=metrics_eeg_embedding,
+        height=args.height,
+        width=args.width,
     )
-
-    def run_mode(
-        name: str,
-        *,
-        high: Optional[EEGAlign],
-        low: Optional[EEGAlign],
-        ip_scale: Optional[float],
-        seed: int,
-        out_dir: Path,
-    ) -> None:
-        save_indices = pick_sample_indices(target_total, args.save_samples, seed)
-        metrics = MetricsTracker(device, clip_model, clip_processor)
-        results[name] = run_eval(
-            name=name,
-            pipe=pipe,
-            loader=loader,
-            device=device,
-            high_model=high,
-            low_model=low,
-            guidance_scale=args.guidance_scale,
-            num_inference_steps=args.num_inference_steps,
-            ip_adapter_scale=ip_scale,
-            save_indices=save_indices,
-            output_dir=out_dir,
-            max_samples=args.max_samples,
-            metrics=metrics,
-            height=args.height,
-            width=args.width,
-            seed=seed,
-        )
-
-    if "high" in args.modes:
-        run_mode(
-            "high",
-            high=high_model,
-            low=None,
-            ip_scale=None,
-            seed=args.seed,
-            out_dir=output_dir / "samples" / "high",
-        )
-
-    if "low" in args.modes:
-        run_mode(
-            "low",
-            high=None,
-            low=low_model,
-            ip_scale=args.ip_adapter_scale,
-            seed=args.seed + 1,
-            out_dir=output_dir / "samples" / "low",
-        )
-
-    if "both" in args.modes:
-        scales = parse_scales(args.ip_adapter_scales)
-        for idx, scale in enumerate(scales):
-            run_name = f"both_scale_{scale}"
-            run_mode(
-                run_name,
-                high=high_model,
-                low=low_model,
-                ip_scale=scale,
-                seed=args.seed + 10 + idx,
-                out_dir=output_dir / "samples" / run_name,
-            )
 
     metrics_path = output_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as fp:

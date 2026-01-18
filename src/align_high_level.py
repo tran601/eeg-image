@@ -55,34 +55,36 @@ def parse_args() -> argparse.Namespace:
         choices=["caption_embeddings", "class_text_embeddings"],
         default="caption_embeddings",
     )
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default=default_device)
     parser.add_argument("--log_dir", type=str, default="logs")
     parser.add_argument("--save_dir", type=str, default="checkpoints")
-    parser.add_argument("--save_every", type=int, default=0)
+    parser.add_argument("--save_every", type=int, default=5)
 
     parser.add_argument("--feature_dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--text_head", choices=["dense", "lowrank"], default="dense")
+    parser.add_argument(
+        "--text_head", choices=["dense", "lowrank"], default="dense"
+    )  # 需要修改
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--num_tokens", type=int, default=77)
     parser.add_argument("--token_dim", type=int, default=768)
-    parser.add_argument("--rank", type=int, default=64)
+    parser.add_argument("--rank", type=int, default=64)  # 需要修改
 
-    parser.add_argument("--mse_weight", type=float, default=1.0)
-    parser.add_argument("--contrast_weight", type=float, default=1.0)
+    parser.add_argument("--mse_weight", type=float, default=1.0)  # 需要修改
+    parser.add_argument("--contrast_weight", type=float, default=1.0)  # 需要修改
     parser.add_argument(
         "--contrastive", choices=["cosine", "infonce"], default="cosine"
-    )
+    )  # 需要修改
     parser.add_argument("--contrastive_temperature", type=float, default=0.07)
     parser.add_argument(
         "--pool_mode", type=str, choices=["mean", "eot"], default="mean"
-    )
+    )  # 需要修改
 
-    parser.add_argument("--sinkhorn_weight", type=float, default=1.0)
+    parser.add_argument("--sinkhorn_weight", type=float, default=1.0)  # 需要修改
     parser.add_argument("--sim_temperature", type=float, default=0.1)
     parser.add_argument("--epsilon", type=float, default=0.1)
     parser.add_argument("--n_iters", type=int, default=50)
@@ -215,7 +217,7 @@ def run_epoch(
             mse=f"{mse_item:.4f}",
             contrast=f"{contrast_item:.4f}",
             sinkhorn=f"{sinkhorn_item:.4f}",
-    )
+        )
 
     assert count > 0, "empty dataloader"
     for key in totals:
@@ -319,9 +321,9 @@ def main() -> None:
             best_val = val_stats["total"]
             save_checkpoint(model, best_path)
         save_checkpoint(model, last_path)
-        if args.save_every > 0 and epoch % args.save_every == 0:
-            epoch_path = ckpt_dir / f"{ckpt_stem}_epoch{epoch}.pt"
-            save_checkpoint(model, epoch_path)
+        # if args.save_every > 0 and epoch % args.save_every == 0:
+        #     epoch_path = ckpt_dir / f"{ckpt_stem}_epoch{epoch}.pt"
+        #     save_checkpoint(model, epoch_path)
 
 
 if __name__ == "__main__":
